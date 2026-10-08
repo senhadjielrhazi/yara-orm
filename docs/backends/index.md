@@ -123,6 +123,28 @@ roots instead.
     which is what a proxy endpoint, an SSH tunnel or a bare IP usually means.
     `verify-ca` is the mode for those: the chain is still verified.
 
+### Rotating a password
+
+PostgreSQL checks the password only when a connection is opened. Connections
+already in the pool keep working after the password changes.
+`YaraOrm.set_password` replaces the password the pool will use
+the *next* time it opens a connection. It does not close the pool, and it does
+not interrupt a query that already holds a connection:
+
+```python
+YaraOrm.set_password(new_password)
+YaraOrm.set_password(reader_password, connection="reader")
+```
+
+Use it for a credential that expires, such as an RDS IAM authentication token
+(15 minutes). Refresh the stored password on a timer shorter than that
+lifetime. Opening a second pool to pick up the new token closes the pool that
+is serving traffic, and any query still on a connection from that pool fails
+with `Pool has been closed`.
+
+Other backends raise `ValueError`: the password is part of the URL they were
+opened with, and there is no separate slot to update.
+
 ## MySQL
 
 The MySQL backend is built on the pure-Rust **mysql_async** driver and its own

@@ -91,6 +91,17 @@ pub trait Backend: Send + Sync {
     /// (e.g. `"SERIALIZABLE"`); the Python layer validates it per dialect.
     async fn begin_tx(&self, isolation: Option<&str>) -> Result<Box<dyn TxConn>, EngineError>;
 
+    /// Replace the password used the next time this pool opens a connection.
+    ///
+    /// Connections already in the pool are left alone: the server checks the
+    /// password only when a connection is opened. The default rejects the call;
+    /// PostgreSQL is the backend that honours it.
+    fn set_password(&self, _password: String) -> Result<(), EngineError> {
+        Err(EngineError::Config(
+            "set_password is supported for PostgreSQL connections only".to_string(),
+        ))
+    }
+
     /// Whether statement futures may be driven to completion *synchronously*
     /// on the calling Python thread (the engine's opt-in sync fast path).
     ///

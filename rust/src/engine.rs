@@ -348,6 +348,13 @@ impl Engine {
         })
     }
 
+    /// Replace the password the pool will use the next time it opens a connection.
+    ///
+    /// Connections already in the pool keep working. PostgreSQL only.
+    fn set_password(&self, password: String) -> PyResult<()> {
+        self.backend.set_password(password).map_err(to_pyerr)
+    }
+
     /// Close the underlying connection pool.
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let backend = self.backend.clone();

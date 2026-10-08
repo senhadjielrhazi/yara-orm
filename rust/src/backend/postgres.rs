@@ -2,10 +2,11 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
-use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Object, Pool, RecyclingMethod};
+use deadpool::managed::{self, Hook, HookError};
+use deadpool_postgres::ClientWrapper;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -14,8 +15,9 @@ use rustls::{
     CertificateError, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
 };
 use tokio_postgres::config::SslMode;
+use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::types::{Kind, ToSql, Type};
-use tokio_postgres::{NoTls, Statement};
+use tokio_postgres::{NoTls, Socket, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::backend::pool::extract_pool_params;
@@ -322,8 +324,108 @@ pub(crate) fn redact(msg: String, url: &str) -> String {
     }
 }
 
+/// The server text of a pool failure.
+///
+/// `tokio_postgres::Error`'s `Display` for a server error is the literal
+/// `"db error"`. Deadpool then wraps that as
+/// `"Error occurred while creating a new object: db error"`, which drops the
+/// SQLSTATE and the message Postgres actually sent. Walk the source chain and
+/// surface `DbError` when it is there.
+fn connection_failure(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(item) = current {
+        if let Some(pg) = item.downcast_ref::<tokio_postgres::Error>() {
+            if let Some(db) = pg.as_db_error() {
+                return format!("{} (SQLSTATE {})", db.message(), db.code().code());
+            }
+        }
+        current = item.source();
+    }
+    err.to_string()
+}
+
+/// A pooled Postgres connection. Named `Object` so the rest of this module
+/// matches the deadpool type it used when the pool was `deadpool_postgres`'s.
+type Object = managed::Object<PgManager>;
+type Pool = managed::Pool<PgManager>;
+
+/// Opens Postgres connections, reading the password at connect time.
+///
+/// The password sits in [`PgManager::password`] rather than being frozen into
+/// the pool. [`PgBackend::set_password`] replaces it; the next physical
+/// connection presents the new one, and connections already checked out are
+/// not touched. Recycling matches deadpool's `RecyclingMethod::Fast`: a closed
+/// connection is discarded, a live one is reused with no extra query.
+struct PgManager {
+    config: tokio_postgres::Config,
+    tls: PgTls,
+    password: Arc<RwLock<Option<String>>>,
+}
+
+/// The two TLS connectors this backend builds. Held as an enum so the pool
+/// manager stays a single type (the `Backend` object cannot be generic).
+enum PgTls {
+    Off(NoTls),
+    On(MakeRustlsConnect),
+}
+
+async fn open_connection<T>(
+    config: tokio_postgres::Config,
+    tls: T,
+) -> Result<ClientWrapper, tokio_postgres::Error>
+where
+    T: MakeTlsConnect<Socket> + Send + 'static,
+    T::Stream: Send,
+    T::TlsConnect: Send,
+    <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
+{
+    let (client, connection) = config.connect(tls).await?;
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(ClientWrapper::new(client, conn_task))
+}
+
+impl managed::Manager for PgManager {
+    type Type = ClientWrapper;
+    type Error = tokio_postgres::Error;
+
+    async fn create(&self) -> Result<ClientWrapper, tokio_postgres::Error> {
+        let mut config = self.config.clone();
+        if let Some(password) = self
+            .password
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            let _ = config.password(password);
+        }
+        // The socket type differs per TLS mode, so each arm owns the connect
+        // and the background task. The driver reports a dropped socket on that
+        // task; the pool notices on the next checkout via `is_closed`.
+        match &self.tls {
+            PgTls::Off(tls) => open_connection(config, *tls).await,
+            PgTls::On(tls) => open_connection(config, tls.clone()).await,
+        }
+    }
+
+    async fn recycle(
+        &self,
+        client: &mut ClientWrapper,
+        _: &managed::Metrics,
+    ) -> managed::RecycleResult<tokio_postgres::Error> {
+        if client.is_closed() {
+            return Err(managed::RecycleError::message("Connection closed"));
+        }
+        Ok(())
+    }
+}
+
 pub struct PgBackend {
     pool: Pool,
+    /// Shared with [`PgManager`]. `None` means the URL carried no password and
+    /// none has been set since; `create` then leaves the parsed config alone.
+    password: Arc<RwLock<Option<String>>>,
     /// When false (URL `statement_cache_size=0`), prepared statements are not
     /// cached per connection — required behind a transaction-pooling proxy
     /// such as PgBouncer, which would otherwise see stale prepared statements.
@@ -448,18 +550,27 @@ impl PgBackend {
             .parse()
             .map_err(|e: tokio_postgres::Error| EngineError::Config(redact(e.to_string(), url)))?;
 
-        let mgr_config = ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        };
         // Honour `sslmode` with a real (rustls) TLS connector, to libpq's
         // semantics: `disable` opts out of TLS; `prefer` (the libpq default)
         // attempts TLS and falls back to plaintext when the server has no SSL;
         // `require` insists on TLS; and `verify-ca`/`verify-full` are the modes
         // that additionally check the certificate (see [`CertCheck`]).
-        let mgr = if pg_config.get_ssl_mode() == SslMode::Disable {
-            Manager::from_config(pg_config, NoTls, mgr_config)
+        let tls = if pg_config.get_ssl_mode() == SslMode::Disable {
+            PgTls::Off(NoTls)
         } else {
-            Manager::from_config(pg_config, make_tls_connector(&ssl)?, mgr_config)
+            PgTls::On(make_tls_connector(&ssl)?)
+        };
+        // The URL password is the initial slot. `set_password` replaces it
+        // later; `create` reads the slot, so a rotation does not rebuild the pool.
+        let password = Arc::new(RwLock::new(
+            pg_config
+                .get_password()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+        ));
+        let mgr = PgManager {
+            config: pg_config,
+            tls,
+            password: Arc::clone(&password),
         };
         // Clamp to at least 1 (like the mysql/mssql/oracle backends): a
         // `?max_size=0` URL would otherwise build a zero-capacity pool, leaving
@@ -472,7 +583,7 @@ impl PgBackend {
             // make `timestamptz` extraction (EXTRACT(HOUR FROM ...)) and
             // CURRENT_TIMESTAMP depend on the server's locale. Applied per
             // connection so lazily-created ones are covered too.
-            .post_create(Hook::async_fn(|client, _| {
+            .post_create(Hook::<PgManager>::async_fn(|client, _| {
                 Box::pin(async move {
                     client
                         .batch_execute("SET TIME ZONE 'UTC'")
@@ -494,7 +605,7 @@ impl PgBackend {
             held.push(
                 pool.get()
                     .await
-                    .map_err(|e| EngineError::Connection(redact(e.to_string(), url)))?,
+                    .map_err(|e| EngineError::Connection(redact(connection_failure(&e), url)))?,
             );
         }
         held[0]
@@ -505,6 +616,7 @@ impl PgBackend {
 
         Ok(Self {
             pool,
+            password,
             cache_statements: params.cache_statements,
         })
     }
@@ -513,7 +625,7 @@ impl PgBackend {
         self.pool
             .get()
             .await
-            .map_err(|e| EngineError::Connection(e.to_string()))
+            .map_err(|e| EngineError::Connection(connection_failure(&e)))
     }
 }
 
@@ -623,6 +735,11 @@ impl Backend for PgBackend {
 
     fn dialect(&self) -> &'static str {
         "postgres"
+    }
+
+    fn set_password(&self, password: String) -> Result<(), EngineError> {
+        *self.password.write().unwrap_or_else(|err| err.into_inner()) = Some(password);
+        Ok(())
     }
 
     async fn close(&self) {
@@ -782,9 +899,15 @@ impl TxConn for PgTx {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_ssl_params, make_tls_connector, redact, root_store, unified_param_types,
-        url_password, CertCheck, SslParams, Type, Value,
+        connection_failure, extract_ssl_params, make_tls_connector, redact, root_store,
+        unified_param_types, url_password, CertCheck, SslParams, Type, Value,
     };
+
+    #[test]
+    fn connection_failure_keeps_a_message_that_is_not_a_server_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert_eq!(connection_failure(&err), "refused");
+    }
 
     #[test]
     fn unified_types_widen_numeric_mixes_across_rows() {
