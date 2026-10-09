@@ -4,6 +4,28 @@ All notable changes to **yara-orm** are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] - 2026-10-09
+
+### Added
+
+- **`YaraOrm.set_password(password, connection="default")`** rotates a
+  PostgreSQL pool's password in place. PostgreSQL checks the password only when
+  a connection opens, so the new password is presented the next time the pool
+  opens one; the pool is not closed and connections already in use keep
+  working. This is the way to refresh a credential that expires, such as an RDS
+  IAM authentication token (15 minutes), without opening a second pool and
+  closing the one serving traffic (which failed in-flight queries with
+  `Pool has been closed`). Until the first rotation the URL's password is used
+  exactly as parsed. Other backends raise `ValueError`: their password is part
+  of the URL they were opened with.
+
+### Changed
+
+- **PostgreSQL connection errors carry the server's message and SQLSTATE.** A
+  failed connect used to surface as the driver's bare `db error`; it now reads,
+  for example, `password authentication failed for user "app" (SQLSTATE 28P01)`.
+  Code that matched on the old `db error` text needs updating.
+
 ## [1.17.0] - 2026-08-31
 
 ### Fixed
