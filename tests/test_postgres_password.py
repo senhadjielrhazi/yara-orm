@@ -85,7 +85,7 @@ async def test_rejected_password_includes_the_sqlstate() -> None:
     url = _with_password(_PG_URL, "not-the-password")
     with pytest.raises(
         DBConnectionError,
-        match=r'password authentication failed for user .+ \(SQLSTATE 28P01\)',
+        match=r"password authentication failed for user .+ \(SQLSTATE 28P01\)",
     ):
         await engine_connect(url)
 
@@ -99,7 +99,7 @@ async def test_set_password_applies_to_the_next_connection_only() -> None:
     password, and restoring the password lets the next connection in
     """
     parsed = urllib.parse.urlsplit(_PG_URL)
-    password = parsed.password
+    password = urllib.parse.unquote(parsed.password) if parsed.password else None
     if not _pg_reachable() or password is None:
         pytest.skip("PostgreSQL with a password in ORM_TEST_DB is required")
     engine = await engine_connect(_with_pool(_PG_URL, max_size=2, min_size=1))

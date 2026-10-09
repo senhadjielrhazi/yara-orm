@@ -423,8 +423,8 @@ impl managed::Manager for PgManager {
 
 pub struct PgBackend {
     pool: Pool,
-    /// Shared with [`PgManager`]. `None` means the URL carried no password and
-    /// none has been set since; `create` then leaves the parsed config alone.
+    /// Shared with [`PgManager`]. `None` means no password has been set since
+    /// connect; `create` then uses the URL's password from the parsed config.
     password: Arc<RwLock<Option<String>>>,
     /// When false (URL `statement_cache_size=0`), prepared statements are not
     /// cached per connection — required behind a transaction-pooling proxy
@@ -560,13 +560,10 @@ impl PgBackend {
         } else {
             PgTls::On(make_tls_connector(&ssl)?)
         };
-        // The URL password is the initial slot. `set_password` replaces it
+        // The slot starts empty so `create` uses the URL's password exactly as
+        // parsed (raw bytes, not necessarily UTF-8). `set_password` fills it
         // later; `create` reads the slot, so a rotation does not rebuild the pool.
-        let password = Arc::new(RwLock::new(
-            pg_config
-                .get_password()
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
-        ));
+        let password = Arc::new(RwLock::new(None));
         let mgr = PgManager {
             config: pg_config,
             tls,
