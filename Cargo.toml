@@ -62,7 +62,7 @@ deadpool = { version = "0.13", features = ["managed", "rt_tokio_1"] }
 # Pure-Rust Microsoft SQL Server driver (TDS protocol — no ODBC / native
 # client, so wheels stay self-contained). rustls TLS (never native-tls, matching
 # the PostgreSQL/MySQL stack); pooled through the same `deadpool` manager.
-tiberius = { version = "0.12", default-features = false, features = [
+tiberius = { version = "0.13", default-features = false, features = [
     "rustls",
     "tds73",
     "chrono",
