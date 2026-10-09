@@ -1012,6 +1012,29 @@ class YaraOrm:
             await previous[0].close()
 
     @classmethod
+    def set_password(cls, password: str, connection: str = "default") -> None:
+        """Replace the password used the next time ``connection`` opens a session.
+
+        PostgreSQL checks the password only when a connection is opened, so
+        sessions already in the pool keep working. A credential that expires
+        (an RDS IAM authentication token, for example) is refreshed here
+        instead of by opening a second pool and closing the one in use.
+
+        Args:
+            password: The password the next new connection should present.
+            connection: Registered connection name. Defaults to ``"default"``.
+
+        Raises:
+            ConfigurationError: If no connection is registered under ``connection``.
+            ValueError: If the connection is not PostgreSQL.
+
+        Returns:
+            None
+        """
+        engine, _dialect = _named_connection(connection)
+        engine.set_password(password)
+
+    @classmethod
     def set_router(cls, router: Router | None) -> None:
         """Set the active per-model connection router.
 

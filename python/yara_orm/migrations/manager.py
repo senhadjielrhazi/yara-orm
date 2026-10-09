@@ -14,7 +14,7 @@ from ..dialects import PRAGMA_FK_OFF, PRAGMA_FK_ON
 from ..exceptions import ConfigurationError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
     from types import ModuleType
 
     from ..connection import BaseDBAsyncClient
@@ -272,7 +272,7 @@ class MigrationManager:
 
     @staticmethod
     @asynccontextmanager
-    async def _maybe_txn(atomic: bool) -> AsyncIterator[None]:
+    async def _maybe_txn(atomic: bool) -> AsyncGenerator[None]:
         """Run the body in a transaction when ``atomic``; otherwise as-is.
 
         Args:
