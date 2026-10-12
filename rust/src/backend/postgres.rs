@@ -429,8 +429,10 @@ impl PgManager {
     ///
     /// The lock is released before a provider runs. The provider may itself
     /// call `set_password`, and holding the read lock across that call would
-    /// deadlock.
-    fn password_for_new_connection(&self) -> Result<Option<String>, OpenError> {
+    /// deadlock. The provider runs on the blocking pool: it takes the GIL and
+    /// may make a network call, and on a runtime worker it would stall every
+    /// query on the connections already open.
+    async fn password_for_new_connection(&self) -> Result<Option<String>, OpenError> {
         let taken = {
             let slot = self.password.read().unwrap_or_else(|err| err.into_inner());
             match &*slot {
@@ -442,7 +444,13 @@ impl PgManager {
         match taken {
             PasswordSlot::Absent => Ok(None),
             PasswordSlot::Fixed(password) => Ok(Some(password)),
-            PasswordSlot::Provider(provider) => provider().map(Some).map_err(OpenError::Password),
+            PasswordSlot::Provider(provider) => tokio::task::spawn_blocking(move || provider())
+                .await
+                .map_err(|err| {
+                    OpenError::Password(format!("password provider did not finish: {err}"))
+                })?
+                .map(Some)
+                .map_err(OpenError::Password),
         }
     }
 }
@@ -453,7 +461,7 @@ impl managed::Manager for PgManager {
 
     async fn create(&self) -> Result<ClientWrapper, OpenError> {
         let mut config = self.config.clone();
-        if let Some(password) = self.password_for_new_connection()? {
+        if let Some(password) = self.password_for_new_connection().await? {
             let _ = config.password(password);
         }
         // The socket type differs per TLS mode, so each arm owns the connect
@@ -685,6 +693,19 @@ impl PgBackend {
             .await
             .map_err(|e| EngineError::Connection(connection_failure(&e)))
     }
+
+    /// Swap in a new password slot.
+    ///
+    /// The old slot is dropped after the write lock is released. Dropping a
+    /// Python provider can run its `__del__`, which may call `set_password`
+    /// again and would deadlock on the lock if it were still held.
+    fn replace_password(&self, slot: PasswordSlot) {
+        let previous = {
+            let mut guard = self.password.write().unwrap_or_else(|err| err.into_inner());
+            std::mem::replace(&mut *guard, slot)
+        };
+        drop(previous);
+    }
 }
 
 fn as_sql_params(params: &[Value]) -> Vec<&(dyn ToSql + Sync)> {
@@ -796,14 +817,12 @@ impl Backend for PgBackend {
     }
 
     fn set_password(&self, password: String) -> Result<(), EngineError> {
-        *self.password.write().unwrap_or_else(|err| err.into_inner()) =
-            PasswordSlot::Fixed(password);
+        self.replace_password(PasswordSlot::Fixed(password));
         Ok(())
     }
 
     fn set_password_provider(&self, provider: PasswordProvider) -> Result<(), EngineError> {
-        *self.password.write().unwrap_or_else(|err| err.into_inner()) =
-            PasswordSlot::Provider(provider);
+        self.replace_password(PasswordSlot::Provider(provider));
         Ok(())
     }
 
